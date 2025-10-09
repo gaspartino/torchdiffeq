@@ -5,6 +5,7 @@ import time
 import numpy as np
 import torch
 import torch.nn as nn
+import torchattacks
 from torch.utils.data import DataLoader
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
@@ -12,14 +13,17 @@ import torchvision.transforms as transforms
 parser = argparse.ArgumentParser()
 parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
 parser.add_argument('--tol', type=float, default=1e-3)
-parser.add_argument('--adjoint', type=eval, default=False, choices=[True, False])
+parser.add_argument('--adjoint', type=eval, default=True, choices=[True, False])
 parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
-parser.add_argument('--nepochs', type=int, default=160)
+parser.add_argument('--nepochs', type=int, default=50)
 parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
 parser.add_argument('--lr', type=float, default=0.1)
 parser.add_argument('--batch_size', type=int, default=128)
 parser.add_argument('--test_batch_size', type=int, default=1000)
+parser.add_argument('--env', type=str, choices=['colab', 'kaggle'], default='kaggle')
 
+parser.add_argument('--dataset', default='lisa', type=str)
+parser.add_argument('--normalize', action='store_true', help='Ativa normalização dos dados')
 parser.add_argument('--save', type=str, default='./experiment1')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
@@ -143,7 +147,31 @@ class Flatten(nn.Module):
         shape = torch.prod(torch.tensor(x.shape[1:])).item()
         return x.view(-1, shape)
 
+def compute_gradient_penalty(model, inputs):
+    inputs = inputs.clone().detach().requires_grad_(True)
+    
+    outputs = model(inputs)
+    if outputs.ndim == 2:  # Caso saída seja (B, C)
+        outputs = outputs.norm(2, dim=1).mean()
+    else:
+        outputs = outputs.mean()
 
+    gradients = torch.autograd.grad(
+        outputs=outputs,
+        inputs=inputs,
+        grad_outputs=torch.ones_like(outputs),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_norm = gradients.norm(2, dim=1)
+    penalty = ((gradient_norm - 1) ** 2).mean()
+    
+    return penalty
+
+    
 class RunningAverageMeter(object):
     """Computes and stores the average and current value"""
 
@@ -161,40 +189,62 @@ class RunningAverageMeter(object):
         else:
             self.avg = self.avg * self.momentum + val * (1 - self.momentum)
         self.val = val
+        
+from torch.autograd import grad
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 
+def lisa_loaders(batch_size=32, normalize):
+    train_dir = "/kaggle/input/cropped-lisa-traffic-light-dataset/cropped_lisa_1/train_1"
+    val_dir = "/kaggle/input/cropped-lisa-traffic-light-dataset/cropped_lisa_1/val_1"
 
-def get_mnist_loaders(data_aug=False, batch_size=128, test_batch_size=1000, perc=1.0):
-    if data_aug:
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(28, padding=4),
-            transforms.ToTensor(),
-        ])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    transform_list = [transforms.Resize((64, 32)), transforms.ToTensor()]
+
+    if normalize:
+        transform_list.append(
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        )
+
+    train_dataset = datasets.ImageFolder(train_dir, transform=transform)
+    test_dataset = datasets.ImageFolder(val_dir, transform=transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    return train_loader, test_loader
+
+def bstl_loaders(batch_size=128, env, normalize):
+    if env == "colab":
+        train_dir = "/content/archive/train"
+        test_dir = "/content/archive/test"
     else:
-        transform_train = transforms.Compose([
-            transforms.ToTensor(),
-        ])
+        train_dir = "/kaggle/input/bstl-dataset/train"
+        test_dir = "/kaggle/input/bstl-dataset/test"
+    
+    transform_list = [transforms.Resize((64, 32)), transforms.ToTensor()]
 
-    transform_test = transforms.Compose([
-        transforms.ToTensor(),
-    ])
+    if normalize:
+        transform_list.append(
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        )
 
-    train_loader = DataLoader(
-        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_train), batch_size=batch_size,
-        shuffle=True, num_workers=2, drop_last=True
-    )
+    transform = transforms.Compose(transform_list)
 
-    train_eval_loader = DataLoader(
-        datasets.MNIST(root='.data/mnist', train=True, download=True, transform=transform_test),
-        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
-    )
+    train_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
+    test_dataset = datasets.ImageFolder(root=test_dir, transform=transform)
 
-    test_loader = DataLoader(
-        datasets.MNIST(root='.data/mnist', train=False, download=True, transform=transform_test),
-        batch_size=test_batch_size, shuffle=False, num_workers=2, drop_last=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False, num_workers=2)
+    train_eval_loader = DataLoader(train_dataset, batch_size=1000, shuffle=False, num_workers=2)
 
-    return train_loader, test_loader, train_eval_loader
+    print(f"Número de imagens em train: {len(train_dataset)}")
+    print(f"Número de imagens em test: {len(test_dataset)}")
+    print(f"Classes: {train_dataset.classes}")
 
+    return train_loader, test_loader, train_eval_loader, 4
 
 def inf_generator(iterable):
     """Allows training with DataLoaders in a single infinite loop:
@@ -226,11 +276,11 @@ def one_hot(x, K):
     return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
 
 
-def accuracy(model, dataset_loader):
+def accuracy(model, dataset_loader, num_classes):
     total_correct = 0
     for x, y in dataset_loader:
         x = x.to(device)
-        y = one_hot(np.array(y.numpy()), 10)
+        y = one_hot(np.array(y.numpy()), num_classes)
 
         target_class = np.argmax(y, axis=1)
         predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
@@ -273,20 +323,36 @@ def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True
 
     return logger
 
+# Função para calcular a acurácia em um conjunto de dados
+def accuracy(model, dataset_loader, device):
+    total_correct = 0
+    total_samples = 0
+    for images, labels in dataset_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        total_samples += labels.size(0)
+        total_correct += (predicted == labels).sum().item()
+
+    return total_correct / total_samples
 
 if __name__ == '__main__':
 
     makedirs(args.save)
-    logger = get_logger(logpath=os.path.join(args.save, 'logs'), filepath=os.path.abspath(__file__))
-    logger.info(args)
 
-    device = torch.device('cuda:' + str(args.gpu) if torch.cuda.is_available() else 'cpu')
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)   
     is_odenet = args.network == 'odenet'
+    if args.dataset == "lisa":
+        train_loader, test_loader, train_eval_loader, num_classes = bstl_loaders(512, args.normalize) 
+    else:
+        train_loader, test_loader, train_eval_loader, num_classes = bstl_loaders(512, args.env, args.normalize) 
 
     if args.downsampling_method == 'conv':
         downsampling_layers = [
-            nn.Conv2d(1, 64, 3, 1),
+            nn.Conv2d(3, 64, 3, 1),
             norm(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, 4, 2, 1),
@@ -296,25 +362,25 @@ if __name__ == '__main__':
         ]
     elif args.downsampling_method == 'res':
         downsampling_layers = [
-            nn.Conv2d(1, 64, 3, 1),
+            nn.Conv2d(3, 64, 3, 1),
             ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
             ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
         ]
 
     feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
-    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, 10)]
+    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, num_classes)]
 
     model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
-
-    logger.info(model)
-    logger.info('Number of parameters: {}'.format(count_parameters(model)))
-
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Usando {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)
+    
+    #cure = CURE_Regularizer(model, device, lambda_=4.0)
     criterion = nn.CrossEntropyLoss().to(device)
-
-    train_loader, test_loader, train_eval_loader = get_mnist_loaders(
-        args.data_aug, args.batch_size, args.test_batch_size
-    )
-
+    
     data_gen = inf_generator(train_loader)
     batches_per_epoch = len(train_loader)
 
@@ -324,12 +390,14 @@ if __name__ == '__main__':
     )
 
     optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-
     best_acc = 0
     batch_time_meter = RunningAverageMeter()
     f_nfe_meter = RunningAverageMeter()
     b_nfe_meter = RunningAverageMeter()
     end = time.time()
+    
+    use_grad_penalty = True
+    lambda_grad = 1.0
 
     for itr in range(args.nepochs * batches_per_epoch):
 
@@ -342,6 +410,8 @@ if __name__ == '__main__':
         y = y.to(device)
         logits = model(x)
         loss = criterion(logits, y)
+        #reg, grad_norm = cure.compute(x, y)
+        #loss = loss + reg
 
         if is_odenet:
             nfe_forward = feature_layers[0].nfe
@@ -362,15 +432,138 @@ if __name__ == '__main__':
 
         if itr % batches_per_epoch == 0:
             with torch.no_grad():
-                train_acc = accuracy(model, train_eval_loader)
-                val_acc = accuracy(model, test_loader)
+                train_acc = accuracy(model, train_eval_loader, device)
+                val_acc = accuracy(model, test_loader, device)
                 if val_acc > best_acc:
                     torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
                     best_acc = val_acc
-                logger.info(
+        
+                print(
                     "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
                     "Train Acc {:.4f} | Test Acc {:.4f}".format(
-                        itr // batches_per_epoch, batch_time_meter.val, batch_time_meter.avg, f_nfe_meter.avg,
-                        b_nfe_meter.avg, train_acc, val_acc
+                        itr // batches_per_epoch,
+                        batch_time_meter.val,
+                        batch_time_meter.avg,
+                        f_nfe_meter.avg,
+                        b_nfe_meter.avg,
+                        train_acc,
+                        val_acc
                     )
                 )
+
+    ckpt_path = "experiment1/model.pth"
+    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+    
+    model.load_state_dict(checkpoint['state_dict'], strict=False)
+    
+    model.eval()
+
+    acc = accuracy(model, test_loader, device)
+    print(f"Accuracy: {acc:.4f}")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    if torch.cuda.device_count() > 1:
+        print(f"Usando {torch.cuda.device_count()} GPUs")
+        model = torch.nn.DataParallel(model)
+    
+    model.to(device)   
+    
+    def accuracy_AA(model, dataset_loader, eps):
+        model.eval()
+        attack = torchattacks.AutoAttack(model, norm='Linf', eps=eps, version='standard', n_classes=4)
+        total_correct = 0
+        total_samples = 0
+    
+        num_batches = len(dataset_loader)
+    
+        for i, (x, y) in enumerate(dataset_loader):
+            x, y = x.to(device), y.to(device)
+    
+            x_adv = attack(x, y)
+    
+            with torch.no_grad():
+                predictions = model(x_adv)
+                predicted_class = predictions.argmax(dim=1)
+    
+            correct = (predicted_class == y).sum().item()
+            total_correct += correct
+            total_samples += y.size(0)
+    
+            batch_acc = correct / y.size(0)
+            print(f"[{i + 1}/{num_batches}] Batch acc: {batch_acc:.4f} | Total acc até agora: {total_correct / total_samples:.4f}")
+            
+        return total_correct / total_samples
+    
+    def accuracy_FGSM(model, dataset_loader, eps):
+        attack = torchattacks.FGSM(model, eps=eps)
+        total_correct = 0
+        total_samples = 0
+    
+        for x, y in dataset_loader:
+            x, y = x.to(device), y.to(device)
+    
+            x_adv = attack(x, y)
+    
+            with torch.no_grad():
+                predictions = model(x_adv)  # Usa o modelo diretamente, mantendo os tensores na GPU
+                predicted_class = predictions.argmax(dim=1)  # Obtém a classe prevista diretamente em PyTorch
+    
+            total_correct += (predicted_class == y).sum().item()
+            total_samples += y.size(0)
+    
+        return total_correct / total_samples
+    
+    def accuracy_PGD(model, dataset_loader, eps):
+        attack = torchattacks.PGD(model, eps=eps)
+        total_correct = 0
+        total_samples = 0
+    
+        for x, y in dataset_loader:
+            x, y = x.to(device), y.to(device)
+    
+            x_adv = attack(x, y)
+    
+            with torch.no_grad():
+                predictions = model(x_adv)  # Usa o modelo diretamente, mantendo os tensores na GPU
+                predicted_class = predictions.argmax(dim=1)  # Obtém a classe prevista diretamente em PyTorch
+    
+            total_correct += (predicted_class == y).sum().item()
+            total_samples += y.size(0)
+    
+        return total_correct / total_samples
+    
+
+    def accuracy_MIM(model, dataset_loader, eps):
+        attack = torchattacks.MIFGSM(model, eps=eps)
+        total_correct = 0
+        total_samples = 0
+    
+        for x, y in dataset_loader:
+            x, y = x.to(device), y.to(device)
+    
+            x_adv = attack(x, y)
+    
+            with torch.no_grad():
+                predictions = model(x_adv)  # Usa o modelo diretamente, mantendo os tensores na GPU
+                predicted_class = predictions.argmax(dim=1)  # Obtém a classe prevista diretamente em PyTorch
+    
+            total_correct += (predicted_class == y).sum().item()
+            total_samples += y.size(0)
+    
+        return total_correct / total_samples
+
+    #all_eps= [8/255, 0.1]
+    all_eps= [0.01, 0.02, 0.03, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
+  
+    for eps in all_eps:
+        accuracy = accuracy_FGSM(model, test_loader, eps)
+        print(f"Accuracy on FGSM (ε={round(eps,2)}): {round(accuracy * 100, 2)}%")
+    
+    for eps in all_eps:
+        accuracy = accuracy_PGD(model, test_loader, eps)
+        print(f"Accuracy on PGD (ε={round(eps,2)}): {round(accuracy * 100, 2)}%")
+        
+    for eps in all_eps:
+        accuracy = accuracy_MIM(model, test_loader, eps)
+        print(f"Accuracy on MIM (ε={round(eps,2)}): {round(accuracy * 100, 2)}%")
