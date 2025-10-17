@@ -553,6 +553,27 @@ if __name__ == '__main__':
     
         return total_correct / total_samples
 
+    def accuracy_CW(model, dataset_loader, device, c=1.0, kappa=0, steps=50, lr=0.01):
+        attack = torchattacks.CW(model, c=c, kappa=kappa, steps=steps, lr=lr)
+        total_correct = 0
+        total_samples = 0
+    
+        model.eval()
+    
+        for x, y in dataset_loader:
+            x, y = x.to(device), y.to(device)
+    
+            x_adv = attack(x, y)
+    
+            with torch.no_grad():
+                outputs = model(x_adv)
+                predicted_class = outputs.argmax(dim=1)
+    
+            total_correct += (predicted_class == y).sum().item()
+            total_samples += y.size(0)
+    
+        return total_correct / total_samples
+    
     #all_eps= [8/255, 0.1]
     all_eps= [0.01, 0.02, 0.03, 0.1, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5]
   
@@ -567,3 +588,7 @@ if __name__ == '__main__':
     for eps in all_eps:
         accuracy = accuracy_MIM(model, test_loader, eps)
         print(f"Accuracy on MIM (ε={round(eps,2)}): {round(accuracy * 100, 2)}%")
+
+    for eps in all_eps:
+        accuracy = accuracy_CW(model, test_loader, device, c=eps, kappa=0, steps=50, lr=0.01)
+        print(f"Accuracy on CW (c={round(eps,2)}): {round(accuracy * 100, 2)}%")
