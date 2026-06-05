@@ -456,7 +456,20 @@ if __name__ == '__main__':
         best_acc = 0
     
         data_gen = inf_generator(train_loader)
+        batches_per_epoch = len(train_loader)
     
+        lr_fn = learning_rate_with_decay(
+            args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+            decay_rates=[1, 0.1, 0.01, 0.001]
+        )
+    
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+        best_acc = 0
+        batch_time_meter = RunningAverageMeter()
+        f_nfe_meter = RunningAverageMeter()
+        b_nfe_meter = RunningAverageMeter()
+        end = time.time()
+        
         for itr in range(args.nepochs * batches_per_epoch):
     
             for param_group in optimizer.param_groups:
