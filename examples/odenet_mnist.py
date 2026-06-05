@@ -511,15 +511,12 @@ if __name__ == '__main__':
                         best_acc = val_acc
             
                     print(
-                        "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                        "Train Acc {:.4f} | Test Acc {:.4f}".format(
-                            itr // batches_per_epoch,
+                        "Epoch {} | Time {:.3f} ({:.3f}) | Train Acc {:.2f}% | Test Acc {:.2f}%".format(
+                            itr // batches_per_epoch + 1,
                             batch_time_meter.val,
                             batch_time_meter.avg,
-                            f_nfe_meter.avg,
-                            b_nfe_meter.avg,
-                            train_acc,
-                            val_acc
+                            train_acc * 100,
+                            val_acc * 100
                         )
                     )
 
