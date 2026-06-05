@@ -426,6 +426,9 @@ if __name__ == '__main__':
         ]
 
     for loop_idx in range(args.total_loops):
+        if args.total_loops > 1:
+            print(f"\n========== Loop {loop_idx + 1}/{args.total_loops} ==========\n")
+            
         feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
         fc_layers = [
             norm(64),
@@ -522,6 +525,11 @@ if __name__ == '__main__':
 
     all_eps = [0.01, 8/255, 0.04, 0.055, 0.07, 0.085, 0.1, 0.115, 0.13, 0.15, 0.175, 0.2]
     for loop_idx in range(args.total_loops):
+        if args.total_loops > 1:
+            print(f"\n{'='*50}")
+            print(f" Avaliando modelo {loop_idx + 1}/{args.total_loops}")
+            print(f"{'='*50}\n")
+            
         ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     
