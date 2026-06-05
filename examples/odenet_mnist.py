@@ -100,9 +100,10 @@ parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--env', type=str, choices=['colab', 'kaggle'], default='kaggle')
 parser.add_argument('--dataset', default='lisa', type=str)
 parser.add_argument('--normalize', action='store_true', help='Ativa normalização dos dados')
-parser.add_argument('--save', type=str, default='./experiment1')
+parser.add_argument('--save', type=str, default='./experiment')
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('-tl', '--total_loops', type=int, default=1)
 args = parser.parse_args()
 
 print(args)
@@ -400,6 +401,7 @@ if __name__ == '__main__':
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(device)   
+    
     is_odenet = args.network == 'odenet'
     if args.dataset == "lisa":
         train_loader, test_loader, train_eval_loader, num_classes = lisa_loaders(512, args.normalize) 
@@ -423,108 +425,109 @@ if __name__ == '__main__':
             ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
         ]
 
-    feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
-    fc_layers = [norm(64), nn.ReLU(inplace=True), nn.AdaptiveAvgPool2d((1, 1)), Flatten(), nn.Linear(64, num_classes)]
-
-    model = nn.Sequential(*downsampling_layers, *feature_layers, *fc_layers).to(device)
+    for loop_idx in range(args.total_loops):
+        feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
+        fc_layers = [
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            Flatten(),
+            nn.Linear(64, num_classes)
+        ]
     
-    if torch.cuda.device_count() > 1:
-        print(f"Usando {torch.cuda.device_count()} GPUs")
-        model = torch.nn.DataParallel(model)
+        model = nn.Sequential(
+            *downsampling_layers,
+            *feature_layers,
+            *fc_layers
+        ).to(device)
     
-    model.to(device)
+        if torch.cuda.device_count() > 1:
+            print(f"Usando {torch.cuda.device_count()} GPUs")
+            model = torch.nn.DataParallel(model)
     
-    criterion = nn.CrossEntropyLoss().to(device)
+        criterion = nn.CrossEntropyLoss().to(device)
     
-    data_gen = inf_generator(train_loader)
-    batches_per_epoch = len(train_loader)
-
-    lr_fn = learning_rate_with_decay(
-        args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
-        decay_rates=[1, 0.1, 0.01, 0.001]
-    )
-
-    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
-    best_acc = 0
-    batch_time_meter = RunningAverageMeter()
-    f_nfe_meter = RunningAverageMeter()
-    b_nfe_meter = RunningAverageMeter()
-    end = time.time()
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=0.9
+        )
     
-    use_grad_penalty = True
-    lambda_grad = 1.0
-
-    for itr in range(args.nepochs * batches_per_epoch):
-
-        for param_group in optimizer.param_groups:
-            param_group['lr'] = lr_fn(itr)
-
-        optimizer.zero_grad()
-        x, y = data_gen.__next__()
-        x = x.to(device)
-        y = y.to(device)
-        logits = model(x)
-        loss = criterion(logits, y)
-        #reg, grad_norm = cure.compute(x, y)
-        #loss = loss + reg
-
-        if is_odenet:
-            nfe_forward = feature_layers[0].nfe
-            feature_layers[0].nfe = 0
-
-        loss.backward()
-        optimizer.step()
-
-        if is_odenet:
-            nfe_backward = feature_layers[0].nfe
-            feature_layers[0].nfe = 0
-
-        batch_time_meter.update(time.time() - end)
-        if is_odenet:
-            f_nfe_meter.update(nfe_forward)
-            b_nfe_meter.update(nfe_backward)
-        end = time.time()
-
-        if itr % batches_per_epoch == 0:
-            with torch.no_grad():
-                train_acc = accuracy(model, train_eval_loader, device)
-                val_acc = accuracy(model, test_loader, device)
-                if val_acc > best_acc:
-                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, 'model.pth'))
-                    best_acc = val_acc
-        
-                print(
-                    "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
-                    "Train Acc {:.4f} | Test Acc {:.4f}".format(
-                        itr // batches_per_epoch,
-                        batch_time_meter.val,
-                        batch_time_meter.avg,
-                        f_nfe_meter.avg,
-                        b_nfe_meter.avg,
-                        train_acc,
-                        val_acc
+        best_acc = 0
+    
+        data_gen = inf_generator(train_loader)
+    
+        for itr in range(args.nepochs * batches_per_epoch):
+    
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr_fn(itr)
+    
+            optimizer.zero_grad()
+            x, y = data_gen.__next__()
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            loss = criterion(logits, y)
+    
+            if is_odenet:
+                nfe_forward = feature_layers[0].nfe
+                feature_layers[0].nfe = 0
+    
+            loss.backward()
+            optimizer.step()
+    
+            if is_odenet:
+                nfe_backward = feature_layers[0].nfe
+                feature_layers[0].nfe = 0
+    
+            batch_time_meter.update(time.time() - end)
+            if is_odenet:
+                f_nfe_meter.update(nfe_forward)
+                b_nfe_meter.update(nfe_backward)
+            end = time.time()
+    
+            if itr % batches_per_epoch == 0:
+                with torch.no_grad():
+    
+                    train_acc = accuracy(model, train_eval_loader, device)
+                    val_acc = accuracy(model, test_loader, device)
+    
+                    if val_acc > best_acc:
+                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, f'ode_{args.dataset}_{loop_idx + 1}.pth'))
+    
+                        best_acc = val_acc
+            
+                    print(
+                        "Epoch {:04d} | Time {:.3f} ({:.3f}) | NFE-F {:.1f} | NFE-B {:.1f} | "
+                        "Train Acc {:.4f} | Test Acc {:.4f}".format(
+                            itr // batches_per_epoch,
+                            batch_time_meter.val,
+                            batch_time_meter.avg,
+                            f_nfe_meter.avg,
+                            b_nfe_meter.avg,
+                            train_acc,
+                            val_acc
+                        )
                     )
-                )
-
-    ckpt_path = "experiment1/model.pth"
-    checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
-    
-    model.load_state_dict(checkpoint['state_dict'], strict=False)
-    
-    model.eval()
-
-    evaluate_model(model, test_loader, device=device)
 
     all_eps = [0.01, 8/255, 0.04, 0.055, 0.07, 0.085, 0.1, 0.115, 0.13, 0.15, 0.175, 0.2]
+    for loop_idx in range(args.total_loops):
+        ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     
-    for eps in all_eps:
-        acc, prec, rec, f1 = accuracy_FGSM(model, test_loader, eps, device, args.normalize)
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+        model.eval()
     
-    for eps in all_eps:
-        acc, prec, rec, f1 = accuracy_PGD(model, test_loader, eps, device, args.normalize)
-
-    for eps in all_eps:
-        acc, prec, rec, f1 = accuracy_MIM(model, test_loader, eps, device, args.normalize)
-
-    for eps in all_eps:
-        acc, prec, rec, f1 = accuracy_AutoAttack(model, test_loader, num_classes, eps, device, args.normalize)
+        evaluate_model(model, test_loader, device=device)
+    
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_FGSM(model, test_loader, eps, device, args.normalize)
+    
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_PGD(model, test_loader, eps, device, args.normalize)
+    
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_MIM(model, test_loader, eps, device, args.normalize)
+    
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_AutoAttack(model, test_loader, num_classes, eps, device, args.normalize)
