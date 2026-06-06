@@ -548,6 +548,6 @@ if __name__ == '__main__':
         for eps in all_eps:
             acc, prec, rec, f1 = accuracy_MIM(model, test_loader, eps, device, args.normalize)
             
-        if args.ignore_autoattack:
+        if not args.ignore_autoattack:
             for eps in all_eps:
                 acc, prec, rec, f1 = accuracy_AutoAttack(model, test_loader, num_classes, eps, device, args.normalize)
