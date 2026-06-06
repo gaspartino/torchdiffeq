@@ -1,454 +1,553 @@
 import os
-import math
-import random
-import argparse
-import logging
-import numpy as np
+import time
 import torch
-import geotorch
-import kagglehub
-import torchvision
+import logging
+import argparse
+import warnings
+import numpy as np
+import torchattacks
 import torch.nn as nn
-import torch.optim as optim
-import torch.nn.functional as F
-import torch.backends.cudnn as cudnn
 import torchvision.datasets as datasets
 import torchvision.transforms as transforms
+from torch.autograd import grad
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from sklearn.metrics import precision_score, recall_score, f1_score
+warnings.filterwarnings("ignore", category=FutureWarning)
 
-from model import *
-from datasets import *
-from sodef_utils import *
-from types import SimpleNamespace
-from torch.nn.parameter import Parameter
-from torch.utils.data import Dataset, DataLoader
-from torchdiffeq import odeint_adjoint as odeint
-from torchvision.models import resnet18, ResNet18_Weights
-from torchvision.datasets import MNIST, CIFAR10, ImageFolder
+def evaluate_model(model, dataset_loader, attack=None, attack_name="Clean", device=None):
+    model.eval()
+    if device is None:
+        device = next(model.parameters()).device
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"
-fc_dim = 64
-args = get_args() 
-seed_torch()
+    y_true_all, y_pred_all = [], []
 
-device = 'cuda' 
-best_acc = 0 
+    for i, (x, y) in enumerate(dataset_loader):
+        x, y = x.to(device), y.to(device)
 
-if args.dataset == 'lisa':
-    trainloader, testloader, train_eval_loader, testset, num_classes = lisa_loaders(train_batch_size=args.batch_size, test_batch_size=args.batch_size, normalize=args.normalize)
-elif args.dataset == 'cifar10':
-    trainloader, testloader, train_eval_loader, testset, num_classes = cifar10_loaders(train_batch_size=args.batch_size, test_batch_size=args.batch_size, normalize=args.normalize )
+        if attack is not None:
+            x = attack(x, y)
+
+        with torch.no_grad():
+            outputs = model(x)
+            predicted_class = outputs.argmax(dim=1)
+
+        y_true_all.extend(y.cpu().numpy())
+        y_pred_all.extend(predicted_class.cpu().numpy())
+
+    acc = (torch.tensor(y_true_all) == torch.tensor(y_pred_all)).float().mean().item()
+    precision = precision_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+    recall = recall_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+    f1 = f1_score(y_true_all, y_pred_all, average='macro', zero_division=0)
+
+    print(f"\n=== {attack_name} RESULTS ===")
+    print(f"Accuracy:  {acc * 100:.2f}%")
+    print(f"Precision: {precision * 100:.2f}%")
+    print(f"Recall:    {recall * 100:.2f}%")
+    print(f"F1-score:  {f1 * 100:.2f}%\n")
+
+    return acc, precision, recall, f1
+
+def accuracy_clean(model, dataset_loader, device):
+    return evaluate_model(model, dataset_loader, None, "Clean", device)
+
+def accuracy_FGSM(model, dataset_loader, eps, device, normalize):
+    attack = torchattacks.FGSM(model, eps=eps)
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+    if normalize:
+        attack.set_normalization_used(mean=mean, std=std)
+
+    return evaluate_model(model, dataset_loader, attack, f"FGSM (ε={eps})", device)
+
+def accuracy_PGD(model, dataset_loader, eps, device, normalize):
+    attack = torchattacks.PGD(model, eps=eps)   
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+    if normalize:
+        attack.set_normalization_used(mean=mean, std=std)
+
+    return evaluate_model(model, dataset_loader, attack, f"PGD (ε={eps})", device)
+
+def accuracy_MIM(model, dataset_loader, eps, device, normalize):
+    attack = torchattacks.MIFGSM(model, eps=eps) 
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+    if normalize:
+        attack.set_normalization_used(mean=mean, std=std)
+
+    return evaluate_model(model, dataset_loader, attack, f"MIM (ε={eps})", device)
+    
+def accuracy_AutoAttack(model, dataset_loader, num_classes, eps, device, normalize):
+    attack = torchattacks.AutoAttack(model, eps=eps, n_classes=num_classes)
+    mean = [0.485, 0.456, 0.406]
+    std  = [0.229, 0.224, 0.225]
+    if normalize:
+        attack.set_normalization_used(mean=mean, std=std)
+
+    return evaluate_model(model, dataset_loader, attack, f"AutoAttack (ε={eps})", device)
+
+parser = argparse.ArgumentParser()
+parser.add_argument('--network', type=str, choices=['resnet', 'odenet'], default='odenet')
+parser.add_argument('--tol', type=float, default=1e-3)
+parser.add_argument('--adjoint', type=eval, default=True, choices=[True, False])
+parser.add_argument('--downsampling-method', type=str, default='conv', choices=['conv', 'res'])
+parser.add_argument('--nepochs', type=int, default=50)
+parser.add_argument('--data_aug', type=eval, default=True, choices=[True, False])
+parser.add_argument('--lr', type=float, default=0.1)
+parser.add_argument('--batch_size', type=int, default=128)
+parser.add_argument('--test_batch_size', type=int, default=1000)
+parser.add_argument('--env', type=str, choices=['colab', 'kaggle'], default='kaggle')
+parser.add_argument('--dataset', default='lisa', type=str)
+parser.add_argument('--normalize', action='store_true', help='Ativa normalização dos dados')
+parser.add_argument('-ia', '--ignore_autoattack', action='store_true')
+parser.add_argument('--save', type=str, default='./experiment')
+parser.add_argument('--debug', action='store_true')
+parser.add_argument('--gpu', type=int, default=0)
+parser.add_argument('-tl', '--total_loops', type=int, default=1)
+args = parser.parse_args()
+
+print(args)
+
+if args.adjoint:
+    from torchdiffeq import odeint_adjoint as odeint
 else:
-    trainloader, testloader, train_eval_loader, testset, num_classes = bstl_loaders(train_batch_size=args.batch_size, test_batch_size=1024, normalize=args.normalize)
+    from torchdiffeq import odeint
 
-print('==> Building model..')
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+def conv3x3(in_planes, out_planes, stride=1):
+    """3x3 convolution with padding"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
 
-for loop_idx in range(args.total_loops):
-    if args.total_loops > 1:
-        print(f"\n========== Loop {loop_idx + 1}/{args.total_loops} ==========\n")
-            
-    net = resnet18(weights=ResNet18_Weights.DEFAULT).to(device)
-    net = nn.Sequential(*list(net.children())[0:-1])
+
+def conv1x1(in_planes, out_planes, stride=1):
+    """1x1 convolution"""
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=stride, bias=False)
+
+
+def norm(dim):
+    return nn.GroupNorm(min(32, dim), dim)
+
+class ResBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, inplanes, planes, stride=1, downsample=None):
+        super(ResBlock, self).__init__()
+        self.norm1 = norm(inplanes)
+        self.relu = nn.ReLU(inplace=True)
+        self.downsample = downsample
+        self.conv1 = conv3x3(inplanes, planes, stride)
+        self.norm2 = norm(planes)
+        self.conv2 = conv3x3(planes, planes)
+
+    def forward(self, x):
+        shortcut = x
+
+        out = self.relu(self.norm1(x))
+
+        if self.downsample is not None:
+            shortcut = self.downsample(out)
+
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+
+        return out + shortcut
+
+class ConcatConv2d(nn.Module):
+
+    def __init__(self, dim_in, dim_out, ksize=3, stride=1, padding=0, dilation=1, groups=1, bias=True, transpose=False):
+        super(ConcatConv2d, self).__init__()
+        module = nn.ConvTranspose2d if transpose else nn.Conv2d
+        self._layer = module(
+            dim_in + 1, dim_out, kernel_size=ksize, stride=stride, padding=padding, dilation=dilation, groups=groups,
+            bias=bias
+        )
+
+    def forward(self, t, x):
+        tt = torch.ones_like(x[:, :1, :, :]) * t
+        ttx = torch.cat([tt, x], 1)
+        return self._layer(ttx)
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(ODEfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm2 = norm(dim)
+        self.conv2 = ConcatConv2d(dim, dim, 3, 1, 1)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        out = self.norm1(x)
+        out = self.relu(out)
+        out = self.conv1(t, out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(t, out)
+        out = self.norm3(out)
+        return out
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=args.tol, atol=args.tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+class Flatten(nn.Module):
+
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, x):
+        shape = torch.prod(torch.tensor(x.shape[1:])).item()
+        return x.view(-1, shape)
+
+def compute_gradient_penalty(model, inputs):
+    inputs = inputs.clone().detach().requires_grad_(True)
     
-    fcs_temp = fcs()
-    fc_layers = MLP_OUT_BALL(num_classes)
+    outputs = model(inputs)
+    if outputs.ndim == 2:  # Caso saída seja (B, C)
+        outputs = outputs.norm(2, dim=1).mean()
+    else:
+        outputs = outputs.mean()
+
+    gradients = torch.autograd.grad(
+        outputs=outputs,
+        inputs=inputs,
+        grad_outputs=torch.ones_like(outputs),
+        create_graph=True,
+        retain_graph=True,
+        only_inputs=True
+    )[0]
+
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_norm = gradients.norm(2, dim=1)
+    penalty = ((gradient_norm - 1) ** 2).mean()
+    
+    return penalty
+
+    
+class RunningAverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, momentum=0.99):
+        self.momentum = momentum
+        self.reset()
+
+    def reset(self):
+        self.val = None
+        self.avg = 0
+
+    def update(self, val):
+        if self.val is None:
+            self.avg = val
+        else:
+            self.avg = self.avg * self.momentum + val * (1 - self.momentum)
+        self.val = val
         
-    net = nn.Sequential(*net, fcs_temp, fc_layers).to(device)
+def lisa_loaders(batch_size=32, normalize=False):
+    train_dir = "/kaggle/input/cropped-lisa-traffic-light-dataset/cropped_lisa_1/train_1"
+    val_dir = "/kaggle/input/cropped-lisa-traffic-light-dataset/cropped_lisa_1/val_1"
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    transform_list = [transforms.Resize((64, 32)), transforms.ToTensor()]
+
+    if normalize:
+        transform_list.append(
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        )
+
+    transform = transforms.Compose(transform_list)
     
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.0001, eps=1e-4, amsgrad=True)
+    train_dataset = datasets.ImageFolder(train_dir, transform=transform)
+    test_dataset = datasets.ImageFolder(val_dir, transform=transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+    train_eval_loader = DataLoader(train_dataset, batch_size=1000, shuffle=False, num_workers=2)
+
+    return train_loader, test_loader, train_eval_loader, 7
     
-    def save_feature(model, dataset_loader, save_path):
-        x_save, y_save = [], []
-        modulelist = list(model)
+def bstl_loaders(env, batch_size=128, normalize=False):
+    if env == "colab":
+        train_dir = "/content/archive/train"
+        test_dir = "/content/archive/test"
+    else:
+        train_dir = "/kaggle/input/bstl-dataset/train"
+        test_dir = "/kaggle/input/bstl-dataset/test"
     
-        for x, y in dataset_loader:
-            x = x.to(device)
-            y_ = y.numpy()
+    transform_list = [transforms.Resize((64, 32)), transforms.ToTensor()]
+
+    if normalize:
+        transform_list.append(
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                 std=[0.229, 0.224, 0.225])
+        )
+
+    transform = transforms.Compose(transform_list)
+
+    train_dataset = datasets.ImageFolder(root=train_dir, transform=transform)
+    test_dataset = datasets.ImageFolder(root=test_dir, transform=transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, num_workers=2)
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False, num_workers=2)
+    train_eval_loader = DataLoader(train_dataset, batch_size=1000, shuffle=False, num_workers=2)
+
+    print(f"Número de imagens em train: {len(train_dataset)}")
+    print(f"Número de imagens em test: {len(test_dataset)}")
+    print(f"Classes: {train_dataset.classes}")
+
+    return train_loader, test_loader, train_eval_loader, 4
+
+def inf_generator(iterable):
+    """Allows training with DataLoaders in a single infinite loop:
+        for i, (x, y) in enumerate(inf_generator(train_loader)):
+    """
+    iterator = iterable.__iter__()
+    while True:
+        try:
+            yield iterator.__next__()
+        except StopIteration:
+            iterator = iterable.__iter__()
+
+def learning_rate_with_decay(batch_size, batch_denom, batches_per_epoch, boundary_epochs, decay_rates):
+    initial_learning_rate = args.lr * batch_size / batch_denom
+
+    boundaries = [int(batches_per_epoch * epoch) for epoch in boundary_epochs]
+    vals = [initial_learning_rate * decay for decay in decay_rates]
+
+    def learning_rate_fn(itr):
+        lt = [itr < b for b in boundaries] + [True]
+        i = np.argmax(lt)
+        return vals[i]
+
+    return learning_rate_fn
+
+def one_hot(x, K):
+    return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def makedirs(dirname):
+    if not os.path.exists(dirname):
+        os.makedirs(dirname)
+
+def get_logger(logpath, filepath, package_files=[], displaying=True, saving=True, debug=False):
+    logger = logging.getLogger()
+    if debug:
+        level = logging.DEBUG
+    else:
+        level = logging.INFO
+    logger.setLevel(level)
+    if saving:
+        info_file_handler = logging.FileHandler(logpath, mode="a")
+        info_file_handler.setLevel(level)
+        logger.addHandler(info_file_handler)
+    if displaying:
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(level)
+        logger.addHandler(console_handler)
+    logger.info(filepath)
+    with open(filepath, "r") as f:
+        logger.info(f.read())
+
+    for f in package_files:
+        logger.info(f)
+        with open(f, "r") as package_f:
+            logger.info(package_f.read())
+
+    return logger
+
+def accuracy(model, dataset_loader, device):
+    total_correct = 0
+    total_samples = 0
+    for images, labels in dataset_loader:
+        images = images.to(device)
+        labels = labels.to(device)
+
+        outputs = model(images)
+        _, predicted = torch.max(outputs.data, 1)
+        total_samples += labels.size(0)
+        total_correct += (predicted == labels).sum().item()
+
+    return total_correct / total_samples
+
+if __name__ == '__main__':
+
+    makedirs(args.save)
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(device)   
     
-            for l in modulelist[:-2]:
-                x = l(x)
+    is_odenet = args.network == 'odenet'
+    if args.dataset == "lisa":
+        train_loader, test_loader, train_eval_loader, num_classes = lisa_loaders(512, args.normalize) 
+    else:
+        train_loader, test_loader, train_eval_loader, num_classes = bstl_loaders(args.env, 1024, args.normalize) 
+
+    if args.downsampling_method == 'conv':
+        downsampling_layers = [
+            nn.Conv2d(3, 64, 3, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 4, 2, 1),
+        ]
+    elif args.downsampling_method == 'res':
+        downsampling_layers = [
+            nn.Conv2d(3, 64, 3, 1),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+            ResBlock(64, 64, stride=2, downsample=conv1x1(64, 64, 2)),
+        ]
+
+    for loop_idx in range(args.total_loops):
+        if args.total_loops > 1:
+            print(f"\n========== Loop {loop_idx + 1}/{args.total_loops} ==========\n")
+            
+        feature_layers = [ODEBlock(ODEfunc(64))] if is_odenet else [ResBlock(64, 64) for _ in range(6)]
+        fc_layers = [
+            norm(64),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            Flatten(),
+            nn.Linear(64, num_classes)
+        ]
     
-            x = net[-2](x[..., 0, 0])
-            x_ = x.cpu().detach().numpy()
+        model = nn.Sequential(
+            *downsampling_layers,
+            *feature_layers,
+            *fc_layers
+        ).to(device)
     
-            x_save.append(x_)
-            y_save.append(y_)
+        if torch.cuda.device_count() > 1:
+            print(f"Usando {torch.cuda.device_count()} GPUs")
+            model = torch.nn.DataParallel(model)
     
-        np.savez(save_path, x_save=np.concatenate(x_save), y_save=np.concatenate(y_save))
+        criterion = nn.CrossEntropyLoss().to(device)
     
-    def train(epoch, trainloader):
-        net.train()
-        train_loss, correct, total = 0, 0, 0
-        modulelist = list(net)
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=0.9
+        )
     
-        for batch_idx, (inputs, targets) in enumerate(trainloader):
-            inputs, targets = inputs.to(device), targets.to(device)
+        best_acc = 0
+    
+        data_gen = inf_generator(train_loader)
+        batches_per_epoch = len(train_loader)
+    
+        lr_fn = learning_rate_with_decay(
+            args.batch_size, batch_denom=128, batches_per_epoch=batches_per_epoch, boundary_epochs=[60, 100, 140],
+            decay_rates=[1, 0.1, 0.01, 0.001]
+        )
+    
+        optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, momentum=0.9)
+        best_acc = 0
+        batch_time_meter = RunningAverageMeter()
+        f_nfe_meter = RunningAverageMeter()
+        b_nfe_meter = RunningAverageMeter()
+        end = time.time()
+        
+        for itr in range(args.nepochs * batches_per_epoch):
+    
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr_fn(itr)
+    
             optimizer.zero_grad()
+            x, y = data_gen.__next__()
+            x = x.to(device)
+            y = y.to(device)
+            logits = model(x)
+            loss = criterion(logits, y)
     
-            x = inputs
-            for l in modulelist[:-2]:
-                x = l(x)
+            if is_odenet:
+                nfe_forward = feature_layers[0].nfe
+                feature_layers[0].nfe = 0
     
-            x = net[-2](x[..., 0, 0])
-            x = net[-1](x)
-            outputs = x
-    
-            loss = criterion(outputs, targets)
             loss.backward()
             optimizer.step()
     
-            train_loss += loss.item()
-            _, predicted = outputs.max(1)
-            total += targets.size(0)
-            correct += predicted.eq(targets).sum().item()
+            if is_odenet:
+                nfe_backward = feature_layers[0].nfe
+                feature_layers[0].nfe = 0
     
-        acc = 100. * correct / total
-        print(f"\nTrain in epoch {epoch+1}: accuracy = {round(acc, 2)}%")
+            batch_time_meter.update(time.time() - end)
+            if is_odenet:
+                f_nfe_meter.update(nfe_forward)
+                b_nfe_meter.update(nfe_backward)
+            end = time.time()
     
-    def test(epoch, testloader, save_model_path, train_eval_loader):
-        global best_acc
-        net.eval()
-        test_loss, correct, total = 0, 0, 0
-        modulelist = list(net)
+            if itr % batches_per_epoch == 0:
+                with torch.no_grad():
     
-        with torch.no_grad():
-            for batch_idx, (inputs, targets) in enumerate(testloader):
-                inputs, targets = inputs.to(device), targets.to(device)
+                    train_acc = accuracy(model, train_eval_loader, device)
+                    val_acc = accuracy(model, test_loader, device)
     
-                x = inputs
-                for l in modulelist[:-2]:
-                    x = l(x)
+                    if val_acc > best_acc:
+                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, f'ode_{args.dataset}_{loop_idx + 1}.pth'))
     
-                x = net[-2](x[..., 0, 0])
-                x = net[-1](x)
-                outputs = x
-    
-                loss = criterion(outputs, targets)
-                test_loss += loss.item()
-    
-                _, predicted = outputs.max(1)
-                total += targets.size(0)
-                correct += predicted.eq(targets).sum().item()
-    
-                
-        acc = 100. * correct / total
-        print(f"Test in epoch {epoch+1}: accuracy = {round(acc, 2)}%")
-        if acc > best_acc:
-            state = {'net': net.state_dict(), 'acc': acc, 'epoch': epoch,}
-            torch.save(state, args.folder_savemodel + f'/extractor{args.total_loops}.pth')
-            best_acc = acc
-    
-            save_feature(net, train_eval_loader, args.train_savepath)
-            save_feature(net, testloader, args.test_savepath)
-    
-    ############################################### Phase 1 ################################################
-    makedirs(args.folder_savemodel)
-    makedirs('./data')
-    
-    #for epoch in range(args.epochs_phase1):
-        #train(epoch, trainloader)
-        #test(epoch, testloader, './models/ckpt.pth', train_eval_loader)
-        
-    ################################################ Phase 2 ################################################
-    weight_diag = 10
-    weight_offdiag = 10
-    weight_norm = 0
-    weight_lossc = 0
-    weight_f = 0.2
-    
-    exponent = 1.0
-    exponent_f = 50
-    exponent_off = 0.1
-    
-    endtime = 1
-    
-    trans = 1.0
-    transoffdig = 1.0
-    trans_f = 0.0
-    numm = 8
-    timescale = 1
-    fc_dim = 64
-    t_dim = 1
-    act = torch.sin
-    act2 = torch.nn.functional.relu
-    
-    class ConcatFC(nn.Module):
-    
-        def __init__(self, dim_in, dim_out):
-            super(ConcatFC, self).__init__()
-            self._layer = nn.Linear(dim_in, dim_out)
-    
-        def forward(self, t, x):
-            return self._layer(x)
-    
-    class ODEfunc_mlp(nn.Module): 
-    
-        def __init__(self, dim):
-            super(ODEfunc_mlp, self).__init__()
-            self.fc1 = ConcatFC(fc_dim, fc_dim)
-            self.act1 = act
-            self.nfe = 0
-    
-        def forward(self, t, x):
-            self.nfe += 1
-            out = -1 * self.fc1(t, x)
-            out = self.act1(out)
-            return out
-    
-    class ODEBlocktemp(nn.Module):
-    
-        def __init__(self, odefunc):
-            super(ODEBlocktemp, self).__init__()
-            self.odefunc = odefunc
-            self.integration_time = torch.tensor([0, endtime]).float()
-    
-        def forward(self, x):
-            out = self.odefunc(0, x)
-            return out
-    
-        @property
-        def nfe(self):
-            return self.odefunc.nfe
-    
-        @nfe.setter
-        def nfe(self, value):
-            self.odefunc.nfe = value
-    
-    class Flatten(nn.Module):
-    
-        def __init__(self):
-            super(Flatten, self).__init__()
-    
-        def forward(self, x):
-            shape = torch.prod(torch.tensor(x.shape[1:])).item()
-            return x.view(-1, shape)
-    
-    class MLP_OUT(nn.Module):
-    
-        def __init__(self, num_classes=10):
-            super(MLP_OUT, self).__init__()
-            self.fc0 = nn.Linear(fc_dim, num_classes)
-    
-        def forward(self, input_):
-            h1 = self.fc0(input_)
-            return h1
-    
-    def one_hot(x, K):
-        return np.array(x[:, None] == np.arange(K)[None, :], dtype=int)
-    
-    def accuracy(model, dataset_loader, num_classes):
-        total_correct = 0
-        for x, y in dataset_loader:
-            x = x.to(device)
-            y = one_hot(np.array(y.numpy()), num_classes)
-    
-            target_class = np.argmax(y, axis=1)
-            predicted_class = np.argmax(model(x).cpu().detach().numpy(), axis=1)
-            total_correct += np.sum(predicted_class == target_class)
-        return total_correct / len(dataset_loader.dataset)
-    
-    
-    def count_parameters(model):
-        return sum(p.numel() for p in model.parameters() if p.requires_grad)
-    
-    def df_dz_regularizer(f, z):
-        regu_diag = 0.
-        regu_offdiag = 0.0
-        for ii in np.random.choice(z.shape[0], min(numm, z.shape[0]), replace=False):
-            batchijacobian = torch.autograd.functional.jacobian(lambda x: odefunc(torch.tensor(1.0).to(device), x),
-                                                                z[ii:ii + 1, ...], create_graph=True)
-            batchijacobian = batchijacobian.view(z.shape[1], -1)
-            if batchijacobian.shape[0] != batchijacobian.shape[1]:
-                raise Exception("wrong dim in jacobian")
-    
-            tempdiag = torch.diagonal(batchijacobian, 0)
-            regu_diag += torch.exp(exponent * (tempdiag + trans))
-    
-            offdiat = torch.sum(
-                torch.abs(batchijacobian) * ((-1 * torch.eye(batchijacobian.shape[0]).to(device) + 0.5) * 2), dim=0)
-            off_diagtemp = torch.exp(exponent_off * (offdiat + transoffdig))
-            regu_offdiag += off_diagtemp
-    
-        return regu_diag / numm, regu_offdiag / numm
-    
-    
-    def f_regularizer(f, z):
-        tempf = torch.abs(odefunc(torch.tensor(1.0).to(device), z))
-        regu_f = torch.pow(exponent_f * tempf, 2)
-        return regu_f
-    
-    
-    def critialpoint_regularizer(y1):
-        regu4 = torch.linalg.norm(y1, dim=1)
-        regu4 = regu4.mean()
-        regu4 = torch.exp(-0.1 * regu4 + 5)
-        return regu4.mean()
-    
-    class DenseDataset(Dataset):
-        def __init__(self, savepath):
-            npzfile = np.load(savepath)
-    
-            self.x = npzfile['x_save']
-            self.y = npzfile['y_save']
-    
-        def __len__(self):
-            return len(self.x)
-    
-        def __getitem__(self, idx):
-            return self.x[idx, ...], self.y[idx]
-    
-    odesavefolder = './EXP/dense_resnet_final'
-    makedirs(odesavefolder)
-    odefunc = ODEfunc_mlp(0)
-    
-    feature_layers = [ODEBlocktemp(odefunc)]
-    fc_layers = [MLP_OUT(num_classes)]
-    
-    for param in fc_layers[0].parameters():
-        param.requires_grad = False
-    
-    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
-    criterion = nn.CrossEntropyLoss().to(device)
-    regularizer = nn.MSELoss()
-    
-    train_loader = DataLoader(DenseDataset(args.train_savepath), batch_size=args.batch_size, shuffle=True, num_workers=1)
-    train_loader__ = DataLoader(DenseDataset(args.train_savepath), batch_size=args.batch_size, shuffle=False, num_workers=1)
-    test_loader = DataLoader(DenseDataset(args.test_savepath), batch_size=args.batch_size, shuffle=False, num_workers=1)
-    
-    data_gen = inf_generator(train_loader)
-    batches_per_epoch = len(train_loader)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2, eps=1e-3, amsgrad=True)
-    
-    best_acc = 0
-    last_model_path = None
+                        best_acc = val_acc
+            
+                    print(
+                        "Epoch {} | Time {:.3f} ({:.3f}) | Train Acc {:.2f}% | Test Acc {:.2f}%".format(
+                            itr // batches_per_epoch + 1,
+                            batch_time_meter.val,
+                            batch_time_meter.avg,
+                            train_acc * 100,
+                            val_acc * 100
+                        )
+                    )
 
-    for itr in range(args.epochs_phase2 * batches_per_epoch):
-        optimizer.zero_grad()
-        x, y = data_gen.__next__()
-        x = x.to(device)
-        y = y.to(device)
-        modulelist = list(model)
-        y0 = x
-        x = modulelist[0](x)
-        y1 = x
-        for l in modulelist[1:]:
-            x = l(x)
-        logits = x
-        y00 = y0  
+    all_eps = [0.01, 8/255, 0.04, 0.055, 0.07, 0.085, 0.1, 0.115, 0.13, 0.15, 0.175, 0.2]
+    for loop_idx in range(args.total_loops):
+        if args.total_loops > 1:
+            print(f"\n{'='*50}")
+            print(f" Avaliando modelo {loop_idx + 1}/{args.total_loops}")
+            print(f"{'='*50}\n")
+            
+        ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
+        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     
-        regu1, regu2 = df_dz_regularizer(odefunc, y00)
-        regu1 = regu1.mean()
-        regu2 = regu2.mean()
-        regu3 = f_regularizer(odefunc, y00)
-        regu3 = regu3.mean()
-        loss = weight_f * regu3 + weight_diag * regu1 + weight_offdiag * regu2
+        model.load_state_dict(checkpoint['state_dict'], strict=False)
+        model.eval()
     
-        if itr % 100 == 1:
-            torch.save({'state_dict': model.state_dict(), 'args': args},
-                       os.path.join(odesavefolder, 'model_diag.pth' + str(itr // 100)))
+        evaluate_model(model, test_loader, device=device)
     
-        loss.backward()
-        optimizer.step()
-        torch.cuda.empty_cache()
-
-        if itr % batches_per_epoch == 0:
-            print(f"Epoch {itr}/{args.epochs_phase2 * batches_per_epoch}")
-        
-            if itr == 0:
-                continue
-        
-            with torch.no_grad():
-                last_model_path = os.path.join(odesavefolder, f"model_{itr // batches_per_epoch}.pth")
-        
-                torch.save({'state_dict': model.state_dict(), 'args': args}, last_model_path)
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_FGSM(model, test_loader, eps, device, args.normalize)
     
-    ################################################ Phase 3, train final FC ################################################
-    endtime = 5
-    layernum = 0
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_PGD(model, test_loader, eps, device, args.normalize)
     
-    folder = last_model_path
-    saved = torch.load(folder, weights_only=False)
-    print('load...', folder)
-    statedic = saved['state_dict']
-    args = saved['args']
-    tol = 1e-5
-    savefolder_fc = './EXP/resnetfct5_15/'
-    print('saving...', savefolder_fc, ' endtime... ',endtime)
-    
-    class ODEBlock(nn.Module):
-    
-        def __init__(self, odefunc):
-            super(ODEBlock, self).__init__()
-            self.odefunc = odefunc
-            self.integration_time = torch.tensor([0, endtime]).float()
-    
-        def forward(self, x):
-            self.integration_time = self.integration_time.type_as(x)
-            out = odeint(self.odefunc, x, self.integration_time, rtol=tol, atol=tol)
-            return out[1]
-    
-        @property
-        def nfe(self):
-            return self.odefunc.nfe
-    
-        @nfe.setter
-        def nfe(self, value):
-            self.odefunc.nfe = value
-    
-    makedirs(savefolder_fc)
-    odefunc = ODEfunc_mlp(0)
-    feature_layers = [ODEBlock(odefunc)]
-    fc_layers = [MLP_OUT(num_classes)]
-    model = nn.Sequential(*feature_layers, *fc_layers).to(device)
-    model.load_state_dict(statedic)
-    for param in odefunc.parameters():
-        param.requires_grad = False
-    
-    criterion = nn.CrossEntropyLoss().to(device)
-    regularizer = nn.MSELoss()
-    
-    train_loader = DataLoader(DenseDataset(args.train_savepath), batch_size=args.batch_size, shuffle=True, num_workers=1)
-    train_loader__ = DataLoader(DenseDataset(args.train_savepath), batch_size=args.batch_size, shuffle=False, num_workers=1)
-    test_loader = DataLoader(DenseDataset(args.test_savepath), batch_size=args.batch_size, shuffle=False, num_workers=1)
-    
-    data_gen = inf_generator(train_loader)
-    batches_per_epoch = len(train_loader)
-    
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-2, eps=1e-3, amsgrad=True)
-    
-    best_acc = 0
-    for itr in range(args.epochs_phase3 * batches_per_epoch):
-    
-        optimizer.zero_grad()
-        x, y = data_gen.__next__()
-        
-        x = x.to(device)
-        y = y.to(device)
-    
-        modulelist = list(model)
-        
-        y0 = x
-        x = modulelist[0](x)
-        y1 = x
-        for l in modulelist[1:]:
-            x = l(x)
-        logits = x
-    
-        loss = criterion(logits, y)
-        loss.backward()
-        optimizer.step()
-        torch.cuda.empty_cache()
-    
-        if itr % batches_per_epoch == 0:
-            if itr == 0:
-                continue
-            with torch.no_grad():
-                val_acc = accuracy(model, test_loader, num_classes)
-                train_acc = accuracy(model, train_loader__, num_classes)
-                if val_acc > best_acc:
-                    torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(savefolder_fc, f'sodef_dense{args.total_loops}.pth'))
-                    best_acc = val_acc
-                print("Epoch {:04d}|Train Acc {:.4f} | Test Acc {:.4f}".format(itr // batches_per_epoch, train_acc, val_acc))
+        for eps in all_eps:
+            acc, prec, rec, f1 = accuracy_MIM(model, test_loader, eps, device, args.normalize)
+            
+        if args.ignore_autoattack:
+            for eps in all_eps:
+                acc, prec, rec, f1 = accuracy_AutoAttack(model, test_loader, num_classes, eps, device, args.normalize)
