@@ -268,8 +268,9 @@ class RunningAverageMeter(object):
         self.val = val
         
 def lisa_loaders(batch_size=32, normalize=False):
-    train_dir = "/kaggle/input/cropped-lisa-traffic-light-dataset/cropped_lisa_1/train_1"
-    val_dir = "/kaggle/input/cropped-lisa-traffic-light-dataset/cropped_lisa_1/val_1"
+    path = kagglehub.dataset_download("chandanakuntala/cropped-lisa-traffic-light-dataset")
+    train_dir = f"{path}/cropped_lisa_1/train_1"
+    val_dir = f"{path}/cropped_lisa_1/val_1"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -293,12 +294,9 @@ def lisa_loaders(batch_size=32, normalize=False):
     return train_loader, test_loader, train_eval_loader, 7
     
 def bstl_loaders(env, batch_size=128, normalize=False):
-    if env == "colab":
-        train_dir = "/content/archive/train"
-        test_dir = "/content/archive/test"
-    else:
-        train_dir = "/kaggle/input/bstl-dataset/train"
-        test_dir = "/kaggle/input/bstl-dataset/test"
+    path = kagglehub.dataset_download("andrevinic/bstl-dataset")
+    train_dir = f"{path}/train"
+    test_dir = f"{path}/test"
     
     transform_list = [transforms.Resize((64, 32)), transforms.ToTensor()]
 
