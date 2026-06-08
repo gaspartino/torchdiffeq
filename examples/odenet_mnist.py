@@ -100,6 +100,7 @@ parser.add_argument('--test_batch_size', type=int, default=1000)
 parser.add_argument('--env', type=str, choices=['colab', 'kaggle'], default='kaggle')
 parser.add_argument('--dataset', default='lisa', type=str)
 parser.add_argument('--normalize', action='store_true', help='Ativa normalização dos dados')
+parser.add_argument('-upn', '--use_pretrained_models', action='store_true', help='Usar modelos treinados')
 parser.add_argument('-ia', '--ignore_autoattack', action='store_true')
 parser.add_argument('--save', type=str, default='./experiment')
 parser.add_argument('--debug', action='store_true')
@@ -427,6 +428,9 @@ if __name__ == '__main__':
         ]
 
     for loop_idx in range(args.total_loops):
+        if args.use_pretrained_models:
+            loop_idx = 9
+            
         if args.total_loops > 1:
             print(f"\n========== Loop {loop_idx + 1}/{args.total_loops} ==========\n")
             
@@ -473,56 +477,57 @@ if __name__ == '__main__':
         f_nfe_meter = RunningAverageMeter()
         b_nfe_meter = RunningAverageMeter()
         end = time.time()
+
+        if not args.use_pretrained_models:
+            for itr in range(args.nepochs * batches_per_epoch):
         
-        for itr in range(args.nepochs * batches_per_epoch):
-    
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr_fn(itr)
-    
-            optimizer.zero_grad()
-            x, y = data_gen.__next__()
-            x = x.to(device)
-            y = y.to(device)
-            logits = model(x)
-            loss = criterion(logits, y)
-    
-            if is_odenet:
-                nfe_forward = feature_layers[0].nfe
-                feature_layers[0].nfe = 0
-    
-            loss.backward()
-            optimizer.step()
-    
-            if is_odenet:
-                nfe_backward = feature_layers[0].nfe
-                feature_layers[0].nfe = 0
-    
-            batch_time_meter.update(time.time() - end)
-            if is_odenet:
-                f_nfe_meter.update(nfe_forward)
-                b_nfe_meter.update(nfe_backward)
-            end = time.time()
-    
-            if itr % batches_per_epoch == 0:
-                with torch.no_grad():
-    
-                    train_acc = accuracy(model, train_eval_loader, device)
-                    val_acc = accuracy(model, test_loader, device)
-    
-                    if val_acc > best_acc:
-                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, f'ode_{args.dataset}_{loop_idx + 1}.pth'))
-    
-                        best_acc = val_acc
-            
-                    print(
-                        "Epoch {} | Time {:.3f} ({:.3f}) | Train Acc {:.2f}% | Test Acc {:.2f}%".format(
-                            itr // batches_per_epoch + 1,
-                            batch_time_meter.val,
-                            batch_time_meter.avg,
-                            train_acc * 100,
-                            val_acc * 100
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr_fn(itr)
+        
+                optimizer.zero_grad()
+                x, y = data_gen.__next__()
+                x = x.to(device)
+                y = y.to(device)
+                logits = model(x)
+                loss = criterion(logits, y)
+        
+                if is_odenet:
+                    nfe_forward = feature_layers[0].nfe
+                    feature_layers[0].nfe = 0
+        
+                loss.backward()
+                optimizer.step()
+        
+                if is_odenet:
+                    nfe_backward = feature_layers[0].nfe
+                    feature_layers[0].nfe = 0
+        
+                batch_time_meter.update(time.time() - end)
+                if is_odenet:
+                    f_nfe_meter.update(nfe_forward)
+                    b_nfe_meter.update(nfe_backward)
+                end = time.time()
+        
+                if itr % batches_per_epoch == 0:
+                    with torch.no_grad():
+        
+                        train_acc = accuracy(model, train_eval_loader, device)
+                        val_acc = accuracy(model, test_loader, device)
+        
+                        if val_acc > best_acc:
+                            torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, f'ode_{args.dataset}_{loop_idx + 1}.pth'))
+        
+                            best_acc = val_acc
+                
+                        print(
+                            "Epoch {} | Time {:.3f} ({:.3f}) | Train Acc {:.2f}% | Test Acc {:.2f}%".format(
+                                itr // batches_per_epoch + 1,
+                                batch_time_meter.val,
+                                batch_time_meter.avg,
+                                train_acc * 100,
+                                val_acc * 100
+                            )
                         )
-                    )
 
     all_eps = [0.01, 8/255, 0.04, 0.055, 0.07, 0.085, 0.1, 0.115, 0.13, 0.15, 0.175, 0.2]
     for loop_idx in range(args.total_loops):
@@ -530,8 +535,13 @@ if __name__ == '__main__':
             print(f"\n{'='*50}")
             print(f" Avaliando modelo {loop_idx + 1}/{args.total_loops}")
             print(f"{'='*50}\n")
+
+        ckpt_path = ""
+        if args.use_pretrained_models:
+            ckpt_path = f"ode_models/{args.dataset}/ode_{args.dataset}_{loop_idx + 1}.pth"
+        else:
+            ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
             
-        ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
         checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
     
         model.load_state_dict(checkpoint['state_dict'], strict=False)
