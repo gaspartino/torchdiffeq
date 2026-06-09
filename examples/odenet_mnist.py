@@ -506,7 +506,7 @@ if __name__ == '__main__':
                     val_acc = accuracy(model, test_loader, device)
     
                     if val_acc > best_acc:
-                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, f'ode_{args.dataset}_{loop_idx + 1}.pth'))
+                        torch.save({'state_dict': model.state_dict(), 'args': args}, os.path.join(args.save, f'ode_{args.dataset}_1.pth'))
     
                         best_acc = val_acc
             
@@ -524,9 +524,9 @@ if __name__ == '__main__':
 
     ckpt_path = ""
     if args.use_pretrained_models:
-        ckpt_path = f"ode_models/{args.dataset}/ode_{args.dataset}_{loop_idx + 1}.pth"
+        ckpt_path = f"ode_models/{args.dataset}/ode_{args.dataset}_1.pth"
     else:
-        ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
+        ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_1.pth")
         
     checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
 
