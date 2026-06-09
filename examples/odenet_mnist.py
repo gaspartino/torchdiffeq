@@ -541,7 +541,38 @@ if __name__ == '__main__':
         else:
             ckpt_path = os.path.join(args.save, f"ode_{args.dataset}_{loop_idx + 1}.pth")
             
-        checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+        if torch.cuda.device_count() > 1:
+            print(f"Usando {torch.cuda.device_count()} GPUs")
+            model = torch.nn.DataParallel(model)
+        
+        checkpoint = torch.load(
+            ckpt_path,
+            map_location=device,
+            weights_only=False
+        )
+        
+        state_dict = checkpoint['state_dict']
+        
+        saved_with_dp = next(iter(state_dict)).startswith("module.")
+        
+        model_is_dp = isinstance(model, torch.nn.DataParallel)
+        
+        if saved_with_dp and not model_is_dp:
+            print("Convertendo checkpoint DataParallel -> modelo normal")
+            state_dict = {
+                k.replace("module.", "", 1): v
+                for k, v in state_dict.items()
+            }
+        
+        elif not saved_with_dp and model_is_dp:
+            print("Convertendo checkpoint normal -> DataParallel")
+            state_dict = {
+                f"module.{k}": v
+                for k, v in state_dict.items()
+            }
+        
+        msg = model.load_state_dict(state_dict, strict=True)
+        print("Checkpoint carregado com sucesso")
     
         model.load_state_dict(checkpoint['state_dict'], strict=False)
         model.eval()
