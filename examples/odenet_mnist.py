@@ -41,7 +41,7 @@ def evaluate_model(model, dataset_loader, attack=None, attack_name="Clean", devi
     recall = recall_score(y_true_all, y_pred_all, average='macro', zero_division=0)
     f1 = f1_score(y_true_all, y_pred_all, average='macro', zero_division=0)
 
-    print(f"{attack_name} | Accuracy:  {acc * 100:.2f}%, Precision: {precision:.4f}%, Recall: {recall:.4f}%, F1-score: {f1:.4f}%")
+    print(f"{attack_name} | Accuracy: {acc * 100:.2f}%, Precision: {precision:.4f}%, Recall: {recall:.4f}%, F1-score: {f1:.4f}%")
 
     return acc, precision, recall, f1
 
